@@ -1,166 +1,198 @@
-mod context;
-mod id;
-mod manager;
-mod process;
-mod processor;
-mod signal;
-mod switch;
+//! Task management implementation
+//!
+//! Everything about task management, like starting and switching tasks is
+//! implemented here.
+//!
+//! A single global instance of [`TaskManager`] called `TASK_MANAGER` controls
+//! all the tasks in the operating system.
+//!
+//! Be careful when you see `__switch` ASM function in `switch.S`. Control flow around this function
+//! might not be what you expect.
+
+
 #[allow(clippy::module_inception)]
 mod task;
 
-use self::id::TaskUserRes;
-use crate::fs::{open_file, OpenFlags};
-use crate::sbi::shutdown;
-use alloc::{sync::Arc, vec::Vec};
+use crate::config::{MAX_APP_NUM,PAGE_SIZE};
+use crate::loader::{get_num_app,get_ksp,get_base_i};
+use crate::polyhal::shutdown;
+use crate::sync::UPSafeCell;
+use log::info;
+use alloc::vec::Vec;
 use lazy_static::*;
-use manager::fetch_task;
-use process::ProcessControlBlock;
-use switch::__switch;
-
-pub use context::TaskContext;
-pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
-pub use manager::{add_task, pid2process, remove_from_pid2process, wakeup_task};
-pub use processor::{
-    current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
-    current_user_token, run_tasks, schedule, take_current_task,
+use task::{TaskControlBlock, TaskStatus};
+use polyhal::{
+    read_current_tp, run_user_task, KContext, KContextArgs, TrapFrame, TrapFrameArgs,
 };
-pub use signal::SignalFlags;
-pub use task::{TaskControlBlock, TaskStatus};
+use polyhal::context_switch;
 
-pub fn suspend_current_and_run_next() {
-    // There must be an application running.
-    let task = take_current_task().unwrap();
-
-    // ---- access current TCB exclusively
-    let mut task_inner = task.inner_exclusive_access();
-    let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
-    // Change status to Ready
-    task_inner.task_status = TaskStatus::Ready;
-    drop(task_inner);
-    // ---- release current TCB
-
-    // push back to ready queue.
-    add_task(task);
-    // jump to scheduling cycle
-    schedule(task_cx_ptr);
+/// The task manager, where all the tasks are managed.
+///
+/// Functions implemented on `TaskManager` deals with all task state transitions
+/// and task context switching. For convenience, you can find wrappers around it
+/// in the module level.
+///
+/// Most of `TaskManager` are hidden behind the field `inner`, to defer
+/// borrowing checks to runtime. You can see examples on how to use `inner` in
+/// existing functions on `TaskManager`.
+pub struct TaskManager {
+    /// total number of tasks
+    num_app: usize,
+    /// use inner value to get mutable access
+    inner: UPSafeCell<TaskManagerInner>,
 }
 
-/// This function must be followed by a schedule
-pub fn block_current_task() -> *mut TaskContext {
-    let task = take_current_task().unwrap();
-    let mut task_inner = task.inner_exclusive_access();
-    task_inner.task_status = TaskStatus::Blocked;
-    &mut task_inner.task_cx as *mut TaskContext
-}
-
-pub fn block_current_and_run_next() {
-    let task_cx_ptr = block_current_task();
-    schedule(task_cx_ptr);
-}
-
-/// Exit the current 'Running' task and run the next task in task list.
-pub fn exit_current_and_run_next(exit_code: i32) {
-    let task = take_current_task().unwrap();
-    let mut task_inner = task.inner_exclusive_access();
-    let process = task.process.upgrade().unwrap();
-    let tid = task_inner.res.as_ref().unwrap().tid;
-    // record exit code
-    task_inner.exit_code = Some(exit_code);
-    task_inner.res = None;
-    // here we do not remove the thread since we are still using the kstack
-    // it will be deallocated when sys_waittid is called
-    drop(task_inner);
-    drop(task);
-    // however, if this is the main thread of current process
-    // the process should terminate at once
-    if tid == 0 {
-        let pid = process.getpid();
-        if pid == IDLE_PID {
-            println!(
-                "[kernel] Idle process exit with exit_code {} ...",
-                exit_code
-            );
-            if exit_code != 0 {
-                //crate::sbi::shutdown(255); //255 == -1 for err hint
-                shutdown(true);
-            } else {
-                //crate::sbi::shutdown(0); //0 for success hint
-                shutdown(false);
-            }
-        }
-        remove_from_pid2process(pid);
-        let mut process_inner = process.inner_exclusive_access();
-        // mark this process as a zombie process
-        process_inner.is_zombie = true;
-        // record exit code of main process
-        process_inner.exit_code = exit_code;
-
-        {
-            // move all child processes under init process
-            let mut initproc_inner = INITPROC.inner_exclusive_access();
-            for child in process_inner.children.iter() {
-                child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
-                initproc_inner.children.push(child.clone());
-            }
-        }
-
-        // deallocate user res (including tid/trap_cx/ustack) of all threads
-        // it has to be done before we dealloc the whole memory_set
-        // otherwise they will be deallocated twice
-        let mut recycle_res = Vec::<TaskUserRes>::new();
-        for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
-            let task = task.as_ref().unwrap();
-            let mut task_inner = task.inner_exclusive_access();
-            if let Some(res) = task_inner.res.take() {
-                recycle_res.push(res);
-            }
-        }
-        // dealloc_tid and dealloc_user_res require access to PCB inner, so we
-        // need to collect those user res first, then release process_inner
-        // for now to avoid deadlock/double borrow problem.
-        drop(process_inner);
-        recycle_res.clear();
-
-        let mut process_inner = process.inner_exclusive_access();
-        process_inner.children.clear();
-        // deallocate other data in user space i.e. program code/data section
-        process_inner.memory_set.recycle_data_pages();
-        // drop file descriptors
-        process_inner.fd_table.clear();
-        // Remove all tasks except for the main thread itself.
-        // This is because we are still using the kstack under the TCB
-        // of the main thread. This TCB, including its kstack, will be
-        // deallocated when the process is reaped via waitpid.
-        while process_inner.tasks.len() > 1 {
-            process_inner.tasks.pop();
-        }
-    }
-    drop(process);
-    // we do not have to save task context
-    let mut _unused = TaskContext::zero_init();
-    schedule(&mut _unused as *mut _);
+/// Inner of Task Manager
+pub struct TaskManagerInner {
+    /// task list
+    tasks: Vec<TaskControlBlock>,
+    /// id of current `Running` task
+    current_task: usize,
 }
 
 lazy_static! {
-    pub static ref INITPROC: Arc<ProcessControlBlock> = {
-        let inode = open_file("initproc", OpenFlags::RDONLY).unwrap();
-        let v = inode.read_all();
-        ProcessControlBlock::new(v.as_slice())
+    /// Global variable: TASK_MANAGER
+    pub static ref TASK_MANAGER: TaskManager = {
+        let num_app = get_num_app();
+        let mut kcx = KContext::blank();
+        let mut tasks = Vec::new();
+        for i in 0..MAX_APP_NUM{
+            tasks.push(TaskControlBlock {
+                task_cx: KContext::blank(),
+                task_status: TaskStatus::UnInit,
+        });}
+        for (i, task) in tasks.iter_mut().enumerate() {
+            task.task_status = TaskStatus::Ready;
+            task.task_cx[KContextArgs::KPC] = task_entry as usize;
+            task.task_cx[KContextArgs::KSP] = get_ksp(i);
+            task.task_cx[KContextArgs::KTP] = read_current_tp();          
+            }
+        TaskManager {
+            num_app,
+            inner: unsafe {
+                UPSafeCell::new(TaskManagerInner {
+                    tasks,
+                    current_task: 0,
+                })
+            },
+        }
     };
 }
 
-pub fn add_initproc() {
-    let _initproc = INITPROC.clone();
+
+impl TaskManager {
+    /// Run the first task in task list.
+    ///
+    /// Generally, the first task in task list is an idle task (we call it zero process later).
+    /// But in ch3, we load apps statically, so the first task is a real app.
+    fn run_first_task(&self) -> ! {
+        let mut inner = self.inner.exclusive_access();
+        let task0 = &mut inner.tasks[0];
+        task0.task_status = TaskStatus::Running;
+        let next_task_cx_ptr = &task0.task_cx as *const KContext;
+        drop(inner);
+        let mut _unused = KContext::blank();
+        // before this, we should drop local variables that must be dropped manually
+        info!("context_switch before!");
+        unsafe {
+            context_switch(&mut _unused as *mut KContext, next_task_cx_ptr);
+        }
+        panic!("unreachable in run_first_task!");
+    }
+
+    /// Change the status of current `Running` task into `Ready`.
+    fn mark_current_suspended(&self) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].task_status = TaskStatus::Ready;
+    }
+
+    /// Change the status of current `Running` task into `Exited`.
+    fn mark_current_exited(&self) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].task_status = TaskStatus::Exited;
+    }
+
+    /// Find next task to run and return task id.
+    ///
+    /// In this case, we only return the first `Ready` task in task list.
+    fn find_next_task(&self) -> Option<usize> {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        (current + 1..current + self.num_app + 1)
+            .map(|id| id % self.num_app)
+            .find(|id| inner.tasks[*id].task_status == TaskStatus::Ready)
+    }
+
+    /// Switch current `Running` task to the task we have found,
+    /// or there is no `Ready` task and we can exit with all applications completed
+    fn run_next_task(&self) {
+        if let Some(next) = self.find_next_task() {
+            let mut inner = self.inner.exclusive_access();
+            let current = inner.current_task;
+            inner.tasks[next].task_status = TaskStatus::Running;
+            inner.current_task = next;
+            let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut KContext;
+            let next_task_cx_ptr = &inner.tasks[next].task_cx as *const KContext;
+            drop(inner);
+            // before this, we should drop local variables that must be dropped manually
+            unsafe {
+                context_switch(current_task_cx_ptr, next_task_cx_ptr);
+            }
+            // go back to user mode
+        } else {
+            println!("All applications completed!");
+            shutdown();
+        }
+    }
+    fn current_task(&self)->usize{
+        self.inner.exclusive_access().current_task
+    }
 }
 
-pub fn check_signals_of_current() -> Option<(i32, &'static str)> {
-    let process = current_process();
-    let process_inner = process.inner_exclusive_access();
-    process_inner.signals.check_error()
+/// run first task
+pub fn run_first_task() {
+    println!("123");
+    TASK_MANAGER.run_first_task();
 }
 
-pub fn current_add_signal(signal: SignalFlags) {
-    let process = current_process();
-    let mut process_inner = process.inner_exclusive_access();
-    process_inner.signals |= signal;
+/// rust next task
+fn run_next_task() {
+    TASK_MANAGER.run_next_task();
+}
+
+/// suspend current task
+fn mark_current_suspended() {
+    TASK_MANAGER.mark_current_suspended();
+}
+
+
+fn task_entry() {
+    let app_id = TASK_MANAGER.current_task();
+    let mut trap_cx = TrapFrame::new();
+    trap_cx[TrapFrameArgs::SEPC] = get_base_i(app_id);
+    trap_cx[TrapFrameArgs::SP] = 0x1_8000_0000 + (app_id+1)*PAGE_SIZE;
+    let ctx_mut = unsafe { (&mut trap_cx as *mut TrapFrame).as_mut().unwrap() };
+    loop {
+        run_user_task(ctx_mut);
+    }
+    panic!("Unreachable in batch::run_current_app!");
+}
+
+/// exit current task
+fn mark_current_exited() {
+    TASK_MANAGER.mark_current_exited();
+}
+
+/// suspend current task, then run next task
+pub fn suspend_current_and_run_next() {
+    mark_current_suspended();
+    run_next_task();
+}
+
+/// exit current task,  then run next task
+pub fn exit_current_and_run_next() {
+    mark_current_exited();
+    run_next_task();
 }

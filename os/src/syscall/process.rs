@@ -1,4 +1,5 @@
 //! Process management syscalls
+
 use crate::task::{exit_current_and_run_next, suspend_current_and_run_next};
 use crate::timer::get_time_ms;
 
@@ -15,7 +16,16 @@ pub fn sys_yield() -> isize {
     0
 }
 
-/// get time in milliseconds
+/// get current time
 pub fn sys_get_time() -> isize {
     get_time_ms() as isize
+}
+
+/// change data segment size
+pub fn sys_sbrk(size: i32) -> isize {
+    //if let Some(old_brk) = change_program_brk(size) {
+    //    old_brk as isize
+    //} else {
+        -1
+    //}
 }

@@ -4,77 +4,60 @@
 //! important ones are:
 //!
 //! - [`trap`]: Handles all cases of switching from userspace to the kernel
+//! - [`task`]: Task management
 //! - [`syscall`]: System call handling and implementation
+//! - [`mm`]: Address map using SV39
+//! - [`sync`]:Wrap a static data structure inside it so that we are able to access it without any `unsafe`.
 //!
 //! The operating system also starts in this module. Kernel code starts
 //! executing from `entry.asm`, after which [`rust_main()`] is called to
 //! initialize various pieces of functionality. (See its source code for
 //! details.)
 //!
-//! We then call [`batch::run_next_app()`] and for the first time go to
+//! We then call [`task::run_tasks()`] and for the first time go to
 //! userspace.
 
-//#![deny(missing_docs)]
 //#![deny(warnings)]
 #![no_std]
 #![no_main]
 #![feature(panic_info_message)]
 #![feature(alloc_error_handler)]
 
-extern crate polyhal;
 extern crate alloc;
+extern crate polyhal;
+
 #[macro_use]
 extern crate bitflags;
-use core::arch::global_asm;
-use buddy_system_allocator::LockedHeap;
-use log::info;
-use polyhal::pagetable::PageTableWrapper;
 
-#[global_allocator]            
-static HEAP_ALLOCATOR: LockedHeap = LockedHeap::empty();
-//use log::*;
 #[macro_use]
 mod console;
-#[path = "boards/qemu.rs"]
-mod board;
-pub mod frame_allocater;
-pub mod heap_allocator;
-pub mod timer;
-mod loader;
+mod config;
 mod lang_items;
 mod logging;
-mod sync;
-pub mod task;
+mod timer;
+#[path="boards/qemu.rs"]
+mod board;
+mod loader;
+pub mod mm;
+pub mod sync;
 pub mod syscall;
-pub mod config;
+pub mod task;
+
 use crate::syscall::syscall;
-pub use crate::frame_allocater::*;
+use crate::task::{suspend_current_and_run_next, exit_current_and_run_next};
 use polyhal::{get_mem_areas, PageAlloc, TrapFrame, TrapFrameArgs, TrapType};
-use task::{suspend_current_and_run_next,exit_current_and_run_next};
 use polyhal::addr::PhysPage;
 use polyhal::TrapType::*;
-pub use heap_allocator::init_heap;
+use log::*;
+
+use core::arch::global_asm;
+
 global_asm!(include_str!("link_app.S"));
 
-pub struct PageAllocImpl;
-
-impl PageAlloc for PageAllocImpl {
-    #[inline]
-    fn alloc(&self) -> PhysPage {
-        frame_alloc_persist().expect("can't find memory page")
-    }
-
-    #[inline]
-    fn dealloc(&self, ppn: PhysPage) {
-        frame_dealloc(ppn)
-    }
-}
-
-/// kernel interrupt
 #[polyhal::arch_interrupt]
 fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
-    // println!("trap_type @ {:x?} {:#x?}", trap_type, ctx);
     match trap_type {
+        Breakpoint => return,
         UserEnvCall => {
             // jump to next instruction anyway
             ctx.syscall_ok();
@@ -95,7 +78,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             exit_current_and_run_next();
         }
         Time => {
-            suspend_current_and_run_next()
+            suspend_current_and_run_next();
         }
         _ => {
             panic!("unsuspended trap type: {:?}", trap_type);
@@ -103,25 +86,35 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
     }
 }
 
-/// the rust entry-point of os
 #[polyhal::arch_entry]
-fn main(hartid: usize) {
+pub fn main(hartid: usize){
+    trace!("ch4 main start: hartid: {}", hartid);
     if hartid != 0 {
         return;
     }
     println!("[kernel] Hello, world!");
-    init_heap();
-    logging::init(Some("trace"));
+    mm::init_heap();
+    logging::init(Some("info"));
+    info!("[kernel] init logging success!");
     polyhal::init(&PageAllocImpl);
     get_mem_areas().into_iter().for_each(|(start, size)| {
-        info!("frame alloocator add frame {:#x} - {:#x}", start, start + size);
-        init_frame_allocator(start, start + size);
+        println!("init memory region {:#x} - {:#x}", start, start + size);
+        mm::init_frame_allocator(start, start + size);
     });
-    let new_page_table = PageTableWrapper::alloc();
-    new_page_table.change();
-    loader::load_apps();
-    println!("456");
-    //timer::set_next_trigger();
     task::run_first_task();
     panic!("Unreachable in rust_main!");
+}
+
+pub struct PageAllocImpl;
+
+impl PageAlloc for PageAllocImpl {
+    #[inline]
+    fn alloc(&self) -> PhysPage {
+        mm::frame_alloc_page_with_clear().expect("failed to alloc page")
+    }
+
+    #[inline]
+    fn dealloc(&self, ppn: PhysPage) {
+        mm::frame_dealloc(ppn)
+    }
 }

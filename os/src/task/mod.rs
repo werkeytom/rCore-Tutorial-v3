@@ -13,18 +13,16 @@
 #[allow(clippy::module_inception)]
 mod task;
 
-use crate::config::{MAX_APP_NUM,PAGE_SIZE};
-use crate::loader::{get_num_app,get_ksp,get_base_i};
+use crate::loader::{get_num_app,get_app_data};
 use crate::polyhal::shutdown;
 use crate::sync::UPSafeCell;
 use log::info;
 use alloc::vec::Vec;
 use lazy_static::*;
 use task::{TaskControlBlock, TaskStatus};
-use polyhal::{
-    read_current_tp, run_user_task, KContext, KContextArgs, TrapFrame, TrapFrameArgs,
-};
-use polyhal::context_switch;
+use polyhal::{KContext, TrapFrame};
+use polyhal::{pagetable::PageTable};
+use polyhal::context_switch_pt;
 
 /// The task manager, where all the tasks are managed.
 ///
@@ -56,17 +54,8 @@ lazy_static! {
         let num_app = get_num_app();
         let mut kcx = KContext::blank();
         let mut tasks = Vec::new();
-        for i in 0..MAX_APP_NUM{
-            tasks.push(TaskControlBlock {
-                task_cx: KContext::blank(),
-                task_status: TaskStatus::UnInit,
-        });}
-        for (i, task) in tasks.iter_mut().enumerate() {
-            task.task_status = TaskStatus::Ready;
-            task.task_cx[KContextArgs::KPC] = task_entry as usize;
-            task.task_cx[KContextArgs::KSP] = get_ksp(i);
-            task.task_cx[KContextArgs::KTP] = read_current_tp();          
-            }
+        for i in 0..num_app{
+            tasks.push(TaskControlBlock::new(get_app_data(i)));}
         TaskManager {
             num_app,
             inner: unsafe {
@@ -90,13 +79,15 @@ impl TaskManager {
         let task0 = &mut inner.tasks[0];
         task0.task_status = TaskStatus::Running;
         let next_task_cx_ptr = &task0.task_cx as *const KContext;
+        let token = task0.memory_set.token();
         drop(inner);
         let mut _unused = KContext::blank();
         // before this, we should drop local variables that must be dropped manually
         info!("context_switch before!");
         unsafe {
-            context_switch(&mut _unused as *mut KContext, next_task_cx_ptr);
+            context_switch_pt(&mut _unused as *mut KContext, next_task_cx_ptr, token);
         }
+        info!("context_switch after!");
         panic!("unreachable in run_first_task!");
     }
 
@@ -135,10 +126,11 @@ impl TaskManager {
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut KContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const KContext;
+            let token = inner.tasks[next].memory_set.token();
             drop(inner);
             // before this, we should drop local variables that must be dropped manually
             unsafe {
-                context_switch(current_task_cx_ptr, next_task_cx_ptr);
+                context_switch_pt(current_task_cx_ptr, next_task_cx_ptr, token);
             }
             // go back to user mode
         } else {
@@ -167,19 +159,6 @@ fn mark_current_suspended() {
     TASK_MANAGER.mark_current_suspended();
 }
 
-
-fn task_entry() {
-    let app_id = TASK_MANAGER.current_task();
-    let mut trap_cx = TrapFrame::new();
-    trap_cx[TrapFrameArgs::SEPC] = get_base_i(app_id);
-    trap_cx[TrapFrameArgs::SP] = 0x1_8000_0000 + (app_id+1)*PAGE_SIZE;
-    let ctx_mut = unsafe { (&mut trap_cx as *mut TrapFrame).as_mut().unwrap() };
-    loop {
-        run_user_task(ctx_mut);
-    }
-    panic!("Unreachable in batch::run_current_app!");
-}
-
 /// exit current task
 fn mark_current_exited() {
     TASK_MANAGER.mark_current_exited();
@@ -195,4 +174,16 @@ pub fn suspend_current_and_run_next() {
 pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
+}
+
+pub fn current_task_tcb() -> *mut TrapFrame {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let ret = inner.tasks[inner.current_task].get_trap_cx() as *mut TrapFrame;
+    ret
+}
+
+pub fn current_user_token() -> PageTable {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let ret = inner.tasks[inner.current_task].get_user_token();
+    ret
 }

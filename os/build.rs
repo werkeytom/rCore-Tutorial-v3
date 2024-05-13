@@ -1,16 +1,31 @@
-use std::env;
 use std::fs::{read_dir, File};
 use std::io::{Result, Write};
+use std::env;
+
+fn get_target_path() -> Option<String> {
+    // 获取环境变量 "TARGET" 的值
+    if let Ok(target) = env::var("TARGET") {
+        let target_path = format!("../user/target/{}/release/", target);
+        Some(target_path)
+    } else {
+        None
+    }
+}
 
 fn main() {
-	let target=env::var("TARGET").unwrap();
     println!("cargo:rerun-if-changed=../user/src/");
-    println!("cargo:rerun-if-changed=../user/target/{}", target);
+    if let Some(target_path) = get_target_path() {
+        println!("cargo:rerun-if-changed={}", target_path);
+    }
+    else{
+        println!("环境变量 TARGET 未设置");
+        return;
+    }
     insert_app_data().unwrap();
 }
 
+
 fn insert_app_data() -> Result<()> {
-	let target=env::var("TARGET").unwrap();
     let mut f = File::create("src/link_app.S").unwrap();
     let mut apps: Vec<_> = read_dir("../user/src/bin")
         .unwrap()
@@ -26,7 +41,7 @@ fn insert_app_data() -> Result<()> {
     writeln!(
         f,
         r#"
-    .align 8
+    .align 3
     .section .data
     .global _num_app
 _num_app:
@@ -41,17 +56,20 @@ _num_app:
 
     for (idx, app) in apps.iter().enumerate() {
         println!("app_{}: {}", idx, app);
-        writeln!(
-            f,
-            r#"
-    .section .data
-    .global app_{0}_start
-    .global app_{0}_end
-app_{0}_start:
-    .incbin "../user/target/{2}/release/{1}.bin"
-app_{0}_end:"#,
-            idx, app, target
-        )?;
+        if let Some(target_path) = get_target_path() {
+            writeln!(
+                f,
+                r#"
+        .section .data
+        .global app_{0}_start
+        .global app_{0}_end
+        .align 3
+    app_{0}_start:
+        .incbin "{2}{1}"
+    app_{0}_end:"#,
+                idx, app, target_path
+            )?;
+        }
     }
     Ok(())
 }

@@ -8,7 +8,7 @@ OBJDUMP := rust-objdump --arch-name=$(ARCH)
 OBJCOPY := rust-objcopy --binary-architecture=$(ARCH)
 
 elf: $(APPS)
-	@python3 build.py
+	@cargo build -Z build-std=alloc,core --release --target ${TARGET}
 
 binary: elf
 	@$(foreach elf, $(ELFS), $(OBJCOPY) $(elf) --strip-all -O binary $(patsubst $(TARGET_DIR)/%, $(TARGET_DIR)/%.bin, $(elf));)

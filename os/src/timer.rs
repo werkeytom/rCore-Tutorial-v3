@@ -1,6 +1,5 @@
 //! RISC-V timer-related functionality
 
-use crate::config::CLOCK_FREQ;
 use polyhal::time::Time;
 
 const TICKS_PER_SEC: usize = 100;
